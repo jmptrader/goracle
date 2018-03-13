@@ -17,19 +17,22 @@ package goracle
 
 /*
 #include <stdlib.h>
-#include <dpi.h>
+#include "dpiImpl.h"
 
 void CallbackSubscr(void *context, dpiSubscrMessage *message);
 */
 import "C"
 import (
+	"log"
 	"unsafe"
 
 	"github.com/pkg/errors"
 )
 
+// CallbackSubscr is the callback for C code on subscription event.
 //export CallbackSubscr
 func CallbackSubscr(ctx unsafe.Pointer, message *C.dpiSubscrMessage) {
+	log.Printf("CB %p %+v", ctx, message)
 	if ctx == nil {
 		return
 	}
@@ -81,18 +84,19 @@ func CallbackSubscr(ctx unsafe.Pointer, message *C.dpiSubscrMessage) {
 	}
 	var err error
 	if message.errorInfo != nil {
-		err = &oraErr{errInfo: *message.errorInfo}
+		err = fromErrorInfo(*message.errorInfo)
 	}
 
-	subscr.events <- Event{
+	subscr.callback(Event{
 		Err:     err,
 		Type:    EventType(message.eventType),
 		DB:      C.GoStringN(message.dbName, C.int(message.dbNameLength)),
 		Tables:  getTables(message.tables, message.numTables),
 		Queries: getQueries(message.queries, message.numQueries),
-	}
+	})
 }
 
+// Event for a subscription.
 type Event struct {
 	Err     error
 	Type    EventType
@@ -100,43 +104,51 @@ type Event struct {
 	Tables  []TableEvent
 	Queries []QueryEvent
 }
+
+// QueryEvent is an event of a Query.
 type QueryEvent struct {
 	Operation
 	ID     uint64
 	Tables []TableEvent
 }
+
+// TableEvent is for a Table-related event.
 type TableEvent struct {
 	Operation
 	Name string
 	Rows []RowEvent
 }
+
+// RowEvent is for row-related event.
 type RowEvent struct {
 	Operation
 	Rowid string
 }
 
+// Subscription for events in the DB.
 type Subscription struct {
 	*conn
 	dpiSubscr *C.dpiSubscr
-	ID        C.uint32_t
-	events    chan<- Event
+	callback  func(Event)
 }
 
-func (c *conn) NewSubscription(events chan<- Event, name string) (*Subscription, error) {
-	subscr := Subscription{conn: c, events: events}
+// NewSubscription creates a new Subscription in the DB.
+func (c *conn) NewSubscription(name string, cb func(Event)) (*Subscription, error) {
+	subscr := Subscription{conn: c, callback: cb}
 	params := (*C.dpiSubscrCreateParams)(C.malloc(C.sizeof_dpiSubscrCreateParams))
 	defer func() { C.free(unsafe.Pointer(params)) }()
 	C.dpiContext_initSubscrCreateParams(c.dpiContext, params)
 	//params.subscrNamespace = C.DPI_SUBSCR_NAMESPACE_DBCHANGE
-	//params.protocol = C.DPI_SUBSCR_PROTO_CALLBACK
-	params.qos = C.DPI_SUBSCR_QOS_BEST_EFFORT | C.DPI_SUBSCR_QOS_QUERY | C.DPI_SUBSCR_QOS_ROWIDS
 	params.protocol = C.DPI_SUBSCR_PROTO_CALLBACK
+	params.qos = C.DPI_SUBSCR_QOS_BEST_EFFORT | C.DPI_SUBSCR_QOS_QUERY | C.DPI_SUBSCR_QOS_ROWIDS
 	params.operations = C.DPI_OPCODE_ALL_OPS
-	params.callbackContext = unsafe.Pointer(&subscr)
+	if name != "" {
+		params.name = C.CString(name)
+		params.nameLength = C.uint32_t(len(name))
+	}
 	// typedef void (*dpiSubscrCallback)(void* context, dpiSubscrMessage *message);
 	params.callback = C.dpiSubscrCallback(C.CallbackSubscr)
-	//params.name = C.CString(name)
-	//params.nameLength = C.uint32_t(len(name))
+	params.callbackContext = unsafe.Pointer(&subscr)
 
 	dpiSubscr := (*C.dpiSubscr)(C.malloc(C.sizeof_void))
 	defer func() { C.free(unsafe.Pointer(dpiSubscr)) }()
@@ -144,7 +156,7 @@ func (c *conn) NewSubscription(events chan<- Event, name string) (*Subscription,
 	if C.dpiConn_newSubscription(c.dpiConn,
 		params,
 		(**C.dpiSubscr)(unsafe.Pointer(&dpiSubscr)),
-		&subscr.ID,
+		nil,
 	) == C.DPI_FAILURE {
 		return nil, errors.Wrap(c.getError(), "newSubscription")
 	}
@@ -152,6 +164,7 @@ func (c *conn) NewSubscription(events chan<- Event, name string) (*Subscription,
 	return &subscr, nil
 }
 
+// Register a query for Change Notification.
 func (s *Subscription) Register(qry string, params ...interface{}) error {
 	cQry := C.CString(qry)
 	defer func() { C.free(unsafe.Pointer(cQry)) }()
@@ -167,19 +180,22 @@ func (s *Subscription) Register(qry string, params ...interface{}) error {
 	if C.dpiStmt_execute(dpiStmt, mode, &qCols) == C.DPI_FAILURE {
 		return errors.Wrap(s.getError(), "executeStmt")
 	}
-	var queryId C.uint64_t
-	if C.dpiStmt_getSubscrQueryId(dpiStmt, &queryId) == C.DPI_FAILURE {
+	var queryID C.uint64_t
+	if C.dpiStmt_getSubscrQueryId(dpiStmt, &queryID) == C.DPI_FAILURE {
 		return errors.Wrap(s.getError(), "getSubscrQueryId")
 	}
-	Log("msg", "subscribed", "query", qry, "id", queryId)
+	if Log != nil {
+		Log("msg", "subscribed", "query", qry, "id", queryID)
+	}
 
 	return nil
 }
 
+// Close the subscription.
 func (s *Subscription) Close() error {
 	dpiSubscr := s.dpiSubscr
 	s.dpiSubscr = nil
-	s.events = nil
+	s.callback = nil
 	if dpiSubscr == nil {
 		return nil
 	}
@@ -189,8 +205,10 @@ func (s *Subscription) Close() error {
 	return nil
 }
 
+// EventType is the type of an event.
 type EventType C.dpiEventType
 
+// Events that can be watched.
 const (
 	EvtStartup     = EventType(C.DPI_EVENT_STARTUP)
 	EvtShutdown    = EventType(C.DPI_EVENT_SHUTDOWN)
@@ -201,23 +219,24 @@ const (
 	EvtQueryChange = EventType(C.DPI_EVENT_QUERYCHANGE)
 )
 
+// Operation in the DB.
 type Operation C.dpiOpCode
 
 const (
-	// 	Indicates that notifications should be sent for all operations on the table or query.
+	// OpAll Indicates that notifications should be sent for all operations on the table or query.
 	OpAll = Operation(C.DPI_OPCODE_ALL_OPS)
-	// 	Indicates that all rows have been changed in the table or query (or too many rows were changed or row information was not requested).
+	// OpAllRows Indicates that all rows have been changed in the table or query (or too many rows were changed or row information was not requested).
 	OpAllRows = Operation(C.DPI_OPCODE_ALL_ROWS)
-	// 	Indicates that an insert operation has taken place in the table or query.
+	// OpInsert Indicates that an insert operation has taken place in the table or query.
 	OpInsert = Operation(C.DPI_OPCODE_INSERT)
-	// 	Indicates that an update operation has taken place in the table or query.
+	// OpUpdate Indicates that an update operation has taken place in the table or query.
 	OpUpdate = Operation(C.DPI_OPCODE_UPDATE)
-	// 	Indicates that a delete operation has taken place in the table or query.
+	// OpDelete Indicates that a delete operation has taken place in the table or query.
 	OpDelete = Operation(C.DPI_OPCODE_DELETE)
-	// 	Indicates that the registered table or query has been altered.
+	// OpAlter Indicates that the registered table or query has been altered.
 	OpAlter = Operation(C.DPI_OPCODE_ALTER)
-	// 	Indicates that the registered table or query has been dropped.
+	// OpDrop Indicates that the registered table or query has been dropped.
 	OpDrop = Operation(C.DPI_OPCODE_DROP)
-	// 	An unknown operation has taken place.
+	// OpUnknown An unknown operation has taken place.
 	OpUnknown = Operation(C.DPI_OPCODE_UNKNOWN)
 )

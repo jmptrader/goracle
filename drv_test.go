@@ -16,29 +16,15 @@
 package goracle
 
 import (
-	"strings"
 	"testing"
-
-	"github.com/pkg/errors"
 )
 
-func TestSubscr(t *testing.T) {
-	_, testCon, err := initConn()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cb := func(e Event) {
-		t.Log(e)
-	}
-	s, err := testCon.NewSubscription("subscr", cb)
-	if err != nil {
-		if strings.Contains(errors.Cause(err).Error(), "ORA-29970:") {
-			t.Skip(err.Error())
-		}
-		t.Fatalf("%+v", err)
-	}
-	defer s.Close()
-	if err := s.Register("SELECT object_name, TO_CHAR(last_ddl_time, 'YYYY-MM-DD HH24:MI:SS') last_ddl_time FROM user_objects"); err != nil {
-		t.Fatalf("%+v", err)
+func TestFromErrorInfo(t *testing.T) {
+	errInfo := newErrorInfo(0, "ORA-24315: érvénytelen attribútumtípus\n")
+	t.Log("errInfo", errInfo)
+	oe := fromErrorInfo(errInfo)
+	t.Log("OraErr", oe)
+	if oe.Code() != 24315 {
+		t.Errorf("got %d, wanted 24315", oe.Code())
 	}
 }

@@ -17,7 +17,7 @@ package goracle
 
 /*
 #include <stdlib.h>
-#include <dpi.h>
+#include "dpiImpl.h"
 */
 import "C"
 
@@ -25,6 +25,10 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"strings"
+	//"fmt"
+	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/pkg/errors"
@@ -38,14 +42,27 @@ var _ = driver.ConnPrepareContext((*conn)(nil))
 var _ = driver.Pinger((*conn)(nil))
 
 type conn struct {
+	sync.RWMutex
 	dpiConn       *C.dpiConn
-	connParams    connectionParams
+	connParams    ConnectionParams
 	inTransaction bool
 	serverVersion VersionInfo
 	*drv
 }
 
+func (c *conn) getError() error {
+	if c == nil || c.drv == nil {
+		return driver.ErrBadConn
+	}
+	return c.drv.getError()
+}
+
 func (c *conn) Break() error {
+	c.RLock()
+	defer c.RUnlock()
+	if Log != nil {
+		Log("msg", "Break", "dpiConn", c.dpiConn)
+	}
 	if C.dpiConn_breakExecution(c.dpiConn) == C.DPI_FAILURE {
 		return errors.Wrap(c.getError(), "Break")
 	}
@@ -56,20 +73,32 @@ func (c *conn) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	done := make(chan struct{}, 1)
+	c.RLock()
+	defer c.RUnlock()
+	done := make(chan error, 1)
 	go func() {
-		select {
-		case <-done:
-		case <-ctx.Done():
-			_ = c.Break()
+		defer close(done)
+		failure := C.dpiConn_ping(c.dpiConn) == C.DPI_FAILURE
+		if failure {
+			done <- maybeBadConn(errors.Wrap(c.getError(), "Ping"))
+			return
 		}
+		done <- nil
 	}()
-	failure := C.dpiConn_ping(c.dpiConn) == C.DPI_FAILURE
-	done <- struct{}{}
-	if failure {
-		return errors.Wrap(c.getError(), "Ping")
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		// select again to avoid race condition if both are done
+		select {
+		case err := <-done:
+			return err
+		default:
+			_ = c.Break()
+			return driver.ErrBadConn
+		}
 	}
-	return nil
 }
 
 // Prepare returns a prepared statement, bound to this connection.
@@ -89,15 +118,30 @@ func (c *conn) Close() error {
 	if c == nil {
 		return nil
 	}
+	c.Lock()
+	defer c.Unlock()
+	c.setTraceTag(TraceTag{})
 	dpiConn := c.dpiConn
 	c.dpiConn = nil
 	if dpiConn == nil {
 		return nil
 	}
-	if C.dpiConn_release(dpiConn) == C.DPI_FAILURE {
-		return errors.Wrap(c.getError(), "Close")
+	// Just to be sure, break anything in progress.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			C.dpiConn_breakExecution(dpiConn)
+		}
+	}()
+	rc := C.dpiConn_release(dpiConn)
+	close(done)
+	var err error
+	if rc == C.DPI_FAILURE {
+		err = errors.Wrap(c.getError(), "Close")
 	}
-	return nil
+	return err
 }
 
 // Begin starts and returns a new transaction.
@@ -132,13 +176,21 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 		return nil, errors.Errorf("%v isolation level is not supported", sql.IsolationLevel(opts.Isolation))
 	}
 
-	dc, err := c.drv.openConn(c.connParams)
-	if err != nil {
-		return nil, err
+	c.RLock()
+	inTran := c.inTransaction
+	c.RUnlock()
+	if inTran {
+		return nil, errors.New("already in transaction")
 	}
-	c2 := dc
-	c2.inTransaction = true
-	return c2, err
+	c.Lock()
+	c.inTransaction = true
+	c.Unlock()
+	if tt, ok := ctx.Value(traceTagCtxKey).(TraceTag); ok {
+		c.Lock()
+		c.setTraceTag(tt)
+		c.Unlock()
+	}
+	return c, nil
 }
 
 // PrepareContext returns a prepared statement, bound to this connection.
@@ -148,8 +200,15 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if tt, ok := ctx.Value(traceTagCtxKey).(TraceTag); ok {
+		c.Lock()
+		c.setTraceTag(tt)
+		c.Unlock()
+	}
 	if query == getConnection {
-		Log("msg", "PrepareContext", "shortcut", query)
+		if Log != nil {
+			Log("msg", "PrepareContext", "shortcut", query)
+		}
 		return &statement{conn: c, query: query}, nil
 	}
 
@@ -157,14 +216,15 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	defer func() {
 		C.free(unsafe.Pointer(cSQL))
 	}()
+	c.RLock()
+	defer c.RUnlock()
 	var dpiStmt *C.dpiStmt
 	if C.dpiConn_prepareStmt(c.dpiConn, 0, cSQL, C.uint32_t(len(query)), nil, 0,
 		(**C.dpiStmt)(unsafe.Pointer(&dpiStmt)),
 	) == C.DPI_FAILURE {
-		return nil, errors.Wrap(c.getError(), "Prepare: "+query)
+		return nil, maybeBadConn(errors.Wrap(c.getError(), "Prepare: "+query))
 	}
-	//fmt.Printf("PrepareContext(%q):%p\n", query, dpiStmt)
-	return &statement{conn: c, dpiStmt: dpiStmt}, nil
+	return &statement{conn: c, dpiStmt: dpiStmt, query: query}, nil
 }
 func (c *conn) Commit() error {
 	return c.endTran(true)
@@ -173,47 +233,56 @@ func (c *conn) Rollback() error {
 	return c.endTran(false)
 }
 func (c *conn) endTran(isCommit bool) error {
-	closeConn := func() error { return nil }
-	if c.inTransaction {
-		closeConn = c.Close
-	}
+	c.Lock()
 	c.inTransaction = false
 
-	var failure bool
-	msg := "Commit"
+	var err error
+	//msg := "Commit"
 	if isCommit {
-		failure = C.dpiConn_commit(c.dpiConn) == C.DPI_FAILURE
+		if C.dpiConn_commit(c.dpiConn) == C.DPI_FAILURE {
+			err = errors.Wrap(c.getError(), "Commit")
+		}
 	} else {
-		failure = C.dpiConn_rollback(c.dpiConn) == C.DPI_FAILURE
-		msg = "Rollback"
+		//msg = "Rollback"
+		if C.dpiConn_rollback(c.dpiConn) == C.DPI_FAILURE {
+			err = errors.Wrap(c.getError(), "Rollback")
+		}
 	}
-	if failure {
-		err := errors.Wrap(c.getError(), msg)
-		closeConn()
-		return err
-	}
-	return closeConn()
+	c.Unlock()
+	//fmt.Printf("%p.%s\n", c, msg)
+	return err
 }
-func (c *conn) newVar(isPlSQLArray bool, typ C.dpiOracleTypeNum, natTyp C.dpiNativeTypeNum, arraySize int, bufSize int) (*C.dpiVar, []C.dpiData, error) {
+
+type varInfo struct {
+	IsPLSArray        bool
+	Typ               C.dpiOracleTypeNum
+	NatTyp            C.dpiNativeTypeNum
+	SliceLen, BufSize int
+}
+
+func (c *conn) newVar(vi varInfo) (*C.dpiVar, []C.dpiData, error) {
 	if c == nil || c.dpiConn == nil {
 		return nil, nil, errors.New("connection is nil")
 	}
 	isArray := C.int(0)
-	if isPlSQLArray && arraySize > 1 {
+	if vi.IsPLSArray {
 		isArray = 1
-	} else if arraySize < 0 {
-		arraySize = 1
+	}
+	if vi.SliceLen < 1 {
+		vi.SliceLen = 1
 	}
 	var dataArr *C.dpiData
 	var v *C.dpiVar
-	Log("C", "dpiConn_newVar", "conn", c.dpiConn, "typ", int(typ), "natTyp", int(natTyp), "arraySize", arraySize, "bufSize", bufSize, "isArray", isArray, "v", v)
+	if Log != nil {
+		Log("C", "dpiConn_newVar", "conn", c.dpiConn, "typ", int(vi.Typ), "natTyp", int(vi.NatTyp), "sliceLen", vi.SliceLen, "bufSize", vi.BufSize, "isArray", isArray, "v", v)
+	}
 	if C.dpiConn_newVar(
-		c.dpiConn, typ, natTyp, C.uint32_t(arraySize),
-		C.uint32_t(bufSize), 1,
+		c.dpiConn, vi.Typ, vi.NatTyp, C.uint32_t(vi.SliceLen),
+		C.uint32_t(vi.BufSize), 1,
 		isArray, nil,
 		&v, &dataArr,
 	) == C.DPI_FAILURE {
-		return nil, nil, errors.Wrapf(c.getError(), "newVar(typ=%d, natTyp=%d, arraySize=%d, bufSize=%d)", typ, natTyp, arraySize, bufSize)
+		return nil, nil, errors.Wrapf(c.getError(), "newVar(typ=%d, natTyp=%d, sliceLen=%d, bufSize=%d)", vi.Typ, vi.NatTyp, vi.SliceLen, vi.BufSize)
 	}
 	// https://github.com/golang/go/wiki/cgo#Turning_C_arrays_into_Go_slices
 	/*
@@ -221,23 +290,171 @@ func (c *conn) newVar(isPlSQLArray bool, typ C.dpiOracleTypeNum, natTyp C.dpiNat
 		length := C.getTheArrayLength()
 		slice := (*[1 << 30]C.YourType)(unsafe.Pointer(theCArray))[:length:length]
 	*/
-	data := ((*[maxArraySize]C.dpiData)(unsafe.Pointer(dataArr)))[:arraySize:arraySize]
+	data := ((*[1 << 30]C.dpiData)(unsafe.Pointer(dataArr)))[:vi.SliceLen:vi.SliceLen]
 	return v, data, nil
 }
 
 var _ = driver.Tx((*conn)(nil))
 
 func (c *conn) ServerVersion() (VersionInfo, error) {
-	if c.serverVersion.Version != 0 {
-		return c.serverVersion, nil
+	c.RLock()
+	sv := c.serverVersion
+	c.RUnlock()
+	if sv.Version != 0 {
+		return sv, nil
 	}
 	var v C.dpiVersionInfo
 	var release *C.char
 	var releaseLen C.uint32_t
 	if C.dpiConn_getServerVersion(c.dpiConn, &release, &releaseLen, &v) == C.DPI_FAILURE {
-		return c.serverVersion, errors.Wrap(c.getError(), "getServerVersion")
+		return sv, errors.Wrap(c.getError(), "getServerVersion")
 	}
+	c.Lock()
 	c.serverVersion.set(&v)
 	c.serverVersion.ServerRelease = C.GoStringN(release, C.int(releaseLen))
-	return c.serverVersion, nil
+	sv = c.serverVersion
+	c.Unlock()
+	return sv, nil
+}
+
+func maybeBadConn(err error) error {
+	if err == nil {
+		return nil
+	}
+	if cd, ok := errors.Cause(err).(interface {
+		Code() int
+	}); ok {
+		// Yes, this is copied from rana/ora, but I've put it there, so it's mine. @tgulacsi
+		switch cd.Code() {
+		case 0:
+			if strings.Contains(err.Error(), " DPI-1002: ") {
+				return driver.ErrBadConn
+			}
+			// cases by experience:
+			// ORA-12170: TNS:Connect timeout occurred
+			// ORA-12528: TNS:listener: all appropriate instances are blocking new connections
+			// ORA-12545: Connect failed because target host or object does not exist
+			// ORA-24315: illegal attribute type
+			// ORA-28547: connection to server failed, probable Oracle Net admin error
+		case 12170, 12528, 12545, 24315, 28547:
+
+			//cases from https://github.com/oracle/odpi/blob/master/src/dpiError.c#L61-L94
+		case 22: // invalid session ID; access denied
+			fallthrough
+		case 28: // your session has been killed
+			fallthrough
+		case 31: // your session has been marked for kill
+			fallthrough
+		case 45: // your session has been terminated with no replay
+			fallthrough
+		case 378: // buffer pools cannot be created as specified
+			fallthrough
+		case 602: // internal programming exception
+			fallthrough
+		case 603: // ORACLE server session terminated by fatal error
+			fallthrough
+		case 609: // could not attach to incoming connection
+			fallthrough
+		case 1012: // not logged on
+			fallthrough
+		case 1041: // internal error. hostdef extension doesn't exist
+			fallthrough
+		case 1043: // user side memory corruption
+			fallthrough
+		case 1089: // immediate shutdown or close in progress
+			fallthrough
+		case 1092: // ORACLE instance terminated. Disconnection forced
+			fallthrough
+		case 2396: // exceeded maximum idle time, please connect again
+			fallthrough
+		case 3113: // end-of-file on communication channel
+			fallthrough
+		case 3114: // not connected to ORACLE
+			fallthrough
+		case 3122: // attempt to close ORACLE-side window on user side
+			fallthrough
+		case 3135: // connection lost contact
+			fallthrough
+		case 12153: // TNS:not connected
+			fallthrough
+		case 12537: // TNS:connection closed
+			fallthrough
+		case 12547: // TNS:lost contact
+			fallthrough
+		case 12570: // TNS:packet reader failure
+			fallthrough
+		case 12583: // TNS:no reader
+			fallthrough
+		case 27146: // post/wait initialization failed
+			fallthrough
+		case 28511: // lost RPC connection
+			fallthrough
+		case 56600: // an illegal OCI function call was issued
+			return driver.ErrBadConn
+		}
+	}
+	return err
+}
+
+func (c *conn) setTraceTag(tt TraceTag) error {
+	if c.dpiConn == nil {
+		return nil
+	}
+	//fmt.Fprintf(os.Stderr, "setTraceTag %s\n", tt)
+	var err error
+	for nm, v := range map[string]*string{
+		"action":     &tt.Action,
+		"module":     &tt.Module,
+		"info":       &tt.ClientInfo,
+		"identifier": &tt.ClientIdentifier,
+		"op":         &tt.DbOp,
+	} {
+		var s *C.char
+		if *v != "" {
+			s = C.CString(*v)
+		}
+		var rc C.int
+		switch nm {
+		case "action":
+			rc = C.dpiConn_setAction(c.dpiConn, s, C.uint32_t(len(*v)))
+		case "module":
+			rc = C.dpiConn_setModule(c.dpiConn, s, C.uint32_t(len(*v)))
+		case "info":
+			rc = C.dpiConn_setClientInfo(c.dpiConn, s, C.uint32_t(len(*v)))
+		case "identifier":
+			rc = C.dpiConn_setClientIdentifier(c.dpiConn, s, C.uint32_t(len(*v)))
+		case "op":
+			rc = C.dpiConn_setDbOp(c.dpiConn, s, C.uint32_t(len(*v)))
+		}
+		if rc == C.DPI_FAILURE && err == nil {
+			err = errors.Wrap(c.getError(), nm)
+		}
+		if s != nil {
+			C.free(unsafe.Pointer(s))
+		}
+	}
+	return err
+}
+
+const traceTagCtxKey = ctxKey("tracetag")
+
+// ContextWithTraceTag returns a context with the specified TraceTag, which will
+// be set on the session used.
+func ContextWithTraceTag(ctx context.Context, tt TraceTag) context.Context {
+	return context.WithValue(ctx, traceTagCtxKey, tt)
+}
+
+// TraceTag holds tracing information for the session. It can be set on the session
+// with ContextWithTraceTag.
+type TraceTag struct {
+	// ClientIdentifier - specifies an end user based on the logon ID, such as HR.HR
+	ClientIdentifier string
+	// ClientInfo - client-specific info
+	ClientInfo string
+	// DbOp - database operation
+	DbOp string
+	// Module - specifies a functional block, such as Accounts Receivable or General Ledger, of an application
+	Module string
+	// Action - specifies an action, such as an INSERT or UPDATE operation, in a module
+	Action string
 }

@@ -16,7 +16,7 @@
 package goracle
 
 /*
-#include <dpi.h>
+#include "dpiImpl.h"
 */
 import "C"
 import (
@@ -33,9 +33,6 @@ import (
 	"github.com/pkg/errors"
 )
 
-const fetchRowCount = 1 << 7
-const maxArraySize = 1 << 10
-
 var _ = driver.Rows((*rows)(nil))
 var _ = driver.RowsColumnTypeDatabaseTypeName((*rows)(nil))
 var _ = driver.RowsColumnTypeLength((*rows)(nil))
@@ -51,6 +48,7 @@ type rows struct {
 	finished       bool
 	vars           []*C.dpiVar
 	data           [][]C.dpiData
+	err            error
 }
 
 // Columns returns the names of the columns. The number of
@@ -67,16 +65,31 @@ func (r *rows) Columns() []string {
 
 // Close closes the rows iterator.
 func (r *rows) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.columns = nil
+	r.data = nil
 	for _, v := range r.vars {
 		C.dpiVar_release(v)
 	}
-	if r.statement.dpiStmt == nil {
+	r.vars = nil
+	if r.statement == nil {
 		return nil
 	}
-	if C.dpiStmt_release(r.statement.dpiStmt) == C.DPI_FAILURE {
-		return errors.Wrap(r.getError(), "Close")
+	st := r.statement
+	r.statement = nil
+
+	st.Lock()
+	defer st.Unlock()
+	if st.dpiStmt == nil {
+		return nil
 	}
-	return nil
+	var err error
+	if C.dpiStmt_release(st.dpiStmt) == C.DPI_FAILURE {
+		err = errors.Wrap(r.getError(), "rows/dpiStmt_release")
+	}
+	return err
 }
 
 // ColumnTypeLength return the length of the column type if the column is a variable length type.
@@ -210,10 +223,10 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 			return reflect.TypeOf(int64(0))
 		case C.DPI_NATIVE_TYPE_UINT64:
 			return reflect.TypeOf(uint64(0))
-		case C.DPI_NATIVE_TYPE_FLOAT:
-			return reflect.TypeOf(float32(0))
-		case C.DPI_NATIVE_TYPE_DOUBLE:
-			return reflect.TypeOf(float64(0))
+		//case C.DPI_NATIVE_TYPE_FLOAT:
+		//	return reflect.TypeOf(float32(0))
+		//case C.DPI_NATIVE_TYPE_DOUBLE:
+		//		return reflect.TypeOf(float64(0))
 		default:
 			return reflect.TypeOf(Number(""))
 		}
@@ -250,17 +263,22 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 //
 // Next should return io.EOF when there are no more rows.
 func (r *rows) Next(dest []driver.Value) error {
+	if r.err != nil {
+		return r.err
+	}
 	if r.finished {
+		_ = r.Close()
 		return io.EOF
 	}
 	if r.fetched == 0 {
 		var moreRows C.int
-		if C.dpiStmt_fetchRows(r.dpiStmt, fetchRowCount, &r.bufferRowIndex, &r.fetched, &moreRows) == C.DPI_FAILURE {
+		if C.dpiStmt_fetchRows(r.dpiStmt, C.uint32_t(r.statement.FetchRowCount()), &r.bufferRowIndex, &r.fetched, &moreRows) == C.DPI_FAILURE {
 			return errors.Wrap(r.getError(), "Next")
 		}
 		//fmt.Printf("bri=%d fetched=%d, moreRows=%d\n", r.bufferRowIndex, r.fetched, moreRows)
 		if r.fetched == 0 {
 			r.finished = moreRows == 0
+			_ = r.Close()
 			return io.EOF
 		}
 		//fmt.Printf("data=%#v\n", r.data)
@@ -272,7 +290,7 @@ func (r *rows) Next(dest []driver.Value) error {
 				if C.dpiVar_getData(r.vars[i], &n, &data) == C.DPI_FAILURE {
 					return errors.Wrapf(r.getError(), "getData[%d]", i)
 				}
-				r.data[i] = (*[fetchRowCount]C.dpiData)(unsafe.Pointer(data))[:n:n]
+				r.data[i] = (*[1 << 30]C.dpiData)(unsafe.Pointer(data))[:n:n]
 				//fmt.Printf("data %d=%+v\n%+v\n", n, data, r.data[i][0])
 			}
 		}
@@ -286,31 +304,31 @@ func (r *rows) Next(dest []driver.Value) error {
 	for i, col := range r.columns {
 		typ := col.OracleType
 		d := &r.data[i][r.bufferRowIndex]
-		Log("msg", "Next", "i", i, "row", r.bufferRowIndex, "data", fmt.Sprintf("%+v", d), "typ", typ)
+		if Log != nil {
+			Log("msg", "Next", "i", i, "row", r.bufferRowIndex) //, "data", fmt.Sprintf("%+v", d), "typ", typ)
+		}
 		isNull := d.isNull == 1
 
 		switch typ {
 		case C.DPI_ORACLE_TYPE_VARCHAR, C.DPI_ORACLE_TYPE_NVARCHAR,
 			C.DPI_ORACLE_TYPE_CHAR, C.DPI_ORACLE_TYPE_NCHAR,
-			C.DPI_ORACLE_TYPE_LONG_VARCHAR,
-			C.DPI_NATIVE_TYPE_BYTES:
+			C.DPI_ORACLE_TYPE_LONG_VARCHAR:
 			//fmt.Printf("CHAR\n")
 			if isNull {
 				dest[i] = ""
 				continue
 			}
 			b := C.dpiData_getBytes(d)
+			if b.length == 0 {
+				dest[i] = ""
+				continue
+			}
 			dest[i] = C.GoStringN(b.ptr, C.int(b.length))
 
 		case C.DPI_ORACLE_TYPE_NUMBER:
 			if isNull {
-				switch col.NativeType {
-				case C.DPI_NATIVE_TYPE_INT64, C.DPI_NATIVE_TYPE_UINT64,
-					C.DPI_NATIVE_TYPE_FLOAT, C.DPI_NATIVE_TYPE_DOUBLE:
-					dest[i] = 0
-				default:
-					dest[i] = nil
-				}
+				//if Log != nil { Log("msg", "null", "i", i, "T", fmt.Sprintf("%T", dest[i]), "type", reflect.TypeOf(dest[i])) }
+				dest[i] = nil
 				continue
 			}
 			switch col.NativeType {
@@ -327,9 +345,13 @@ func (r *rows) Next(dest []driver.Value) error {
 			default:
 				b := C.dpiData_getBytes(d)
 				dest[i] = Number(C.GoStringN(b.ptr, C.int(b.length)))
-				Log("msg", "b", "i", i, "ptr", b.ptr, "length", b.length, "typ", col.NativeType, "int64", C.dpiData_getInt64(d), "dest", dest[i])
+				if Log != nil {
+					Log("msg", "b", "i", i, "ptr", b.ptr, "length", b.length, "typ", col.NativeType, "int64", C.dpiData_getInt64(d), "dest", dest[i])
+				}
 			}
-			Log("msg", "num", "t", col.NativeType, "i", i, "dest", fmt.Sprintf("%T %+v", dest[i], dest[i]))
+			if Log != nil {
+				Log("msg", "num", "t", col.NativeType, "i", i, "dest", fmt.Sprintf("%T %+v", dest[i], dest[i]))
+			}
 
 		case C.DPI_ORACLE_TYPE_ROWID, C.DPI_NATIVE_TYPE_ROWID,
 			C.DPI_ORACLE_TYPE_RAW, C.DPI_ORACLE_TYPE_LONG_RAW:
@@ -337,36 +359,35 @@ func (r *rows) Next(dest []driver.Value) error {
 				dest[i] = nil
 				continue
 			}
-			fmt.Printf("RAW\n")
 			b := C.dpiData_getBytes(d)
+			if b.length == 0 {
+				dest[i] = []byte{}
+				continue
+			}
 			dest[i] = C.GoBytes(unsafe.Pointer(b.ptr), C.int(b.length))
 		case C.DPI_ORACLE_TYPE_NATIVE_FLOAT, C.DPI_NATIVE_TYPE_FLOAT:
 			if isNull {
 				dest[i] = nil
 				continue
 			}
-			fmt.Printf("FLOAT\n")
 			dest[i] = float32(C.dpiData_getFloat(d))
 		case C.DPI_ORACLE_TYPE_NATIVE_DOUBLE, C.DPI_NATIVE_TYPE_DOUBLE:
 			if isNull {
 				dest[i] = nil
 				continue
 			}
-			fmt.Printf("DOUBLE\n")
 			dest[i] = float64(C.dpiData_getDouble(d))
 		case C.DPI_ORACLE_TYPE_NATIVE_INT, C.DPI_NATIVE_TYPE_INT64:
 			if isNull {
 				dest[i] = nil
 				continue
 			}
-			fmt.Printf("INT\n")
 			dest[i] = int64(C.dpiData_getInt64(d))
 		case C.DPI_ORACLE_TYPE_NATIVE_UINT, C.DPI_NATIVE_TYPE_UINT64:
 			if isNull {
 				dest[i] = nil
 				continue
 			}
-			fmt.Printf("UINT\n")
 			dest[i] = uint64(C.dpiData_getUint64(d))
 		case C.DPI_ORACLE_TYPE_TIMESTAMP,
 			C.DPI_ORACLE_TYPE_TIMESTAMP_TZ, C.DPI_ORACLE_TYPE_TIMESTAMP_LTZ,
@@ -376,14 +397,10 @@ func (r *rows) Next(dest []driver.Value) error {
 				dest[i] = time.Time{}
 				continue
 			}
-			//fmt.Printf("TS\n")
 			ts := C.dpiData_getTimestamp(d)
 			tz := time.Local
 			if col.OracleType != C.DPI_ORACLE_TYPE_TIMESTAMP && col.OracleType != C.DPI_ORACLE_TYPE_DATE {
-				tz = time.FixedZone(
-					fmt.Sprintf("%02d:%02d", ts.tzHourOffset, ts.tzMinuteOffset),
-					int(ts.tzHourOffset)*3600+int(ts.tzMinuteOffset)*60,
-				)
+				tz = timeZoneFor(ts.tzHourOffset, ts.tzMinuteOffset)
 			}
 			dest[i] = time.Date(int(ts.year), time.Month(ts.month), int(ts.day), int(ts.hour), int(ts.minute), int(ts.second), int(ts.fsecond), tz)
 		case C.DPI_ORACLE_TYPE_INTERVAL_DS, C.DPI_NATIVE_TYPE_INTERVAL_DS:
@@ -391,7 +408,6 @@ func (r *rows) Next(dest []driver.Value) error {
 				dest[i] = time.Time{}
 				continue
 			}
-			fmt.Printf("INTERVAL_DS\n")
 			ds := C.dpiData_getIntervalDS(d)
 			dest[i] = time.Duration(ds.days)*24*time.Hour +
 				time.Duration(ds.hours)*time.Hour +
@@ -403,33 +419,47 @@ func (r *rows) Next(dest []driver.Value) error {
 				dest[i] = nil
 				continue
 			}
-			fmt.Printf("INTERVAL_YM\n")
 			ym := C.dpiData_getIntervalYM(d)
 			dest[i] = fmt.Sprintf("%dy%dm", ym.years, ym.months)
 		case C.DPI_ORACLE_TYPE_CLOB, C.DPI_ORACLE_TYPE_NCLOB,
 			C.DPI_ORACLE_TYPE_BLOB,
 			C.DPI_ORACLE_TYPE_BFILE,
 			C.DPI_NATIVE_TYPE_LOB:
+			isClob := typ == C.DPI_ORACLE_TYPE_CLOB || typ == C.DPI_ORACLE_TYPE_NCLOB
 			if isNull {
-				dest[i] = nil
+				if isClob && r.ClobAsString() {
+					dest[i] = ""
+				} else {
+					dest[i] = nil
+				}
 				continue
 			}
-			//fmt.Printf("LOB\n")
-			rdr := &dpiLobReader{dpiLob: C.dpiData_getLOB(d), conn: r.conn,
-				IsClob: typ == C.DPI_ORACLE_TYPE_CLOB || typ == C.DPI_ORACLE_TYPE_NCLOB}
+			rdr := &dpiLobReader{dpiLob: C.dpiData_getLOB(d), conn: r.conn, IsClob: isClob}
+			if isClob && r.ClobAsString() {
+				sb := stringBuilders.Get()
+				if _, err := io.Copy(sb, rdr); err != nil {
+					stringBuilders.Put(sb)
+					return err
+				}
+				dest[i] = sb.String()
+				stringBuilders.Put(sb)
+				continue
+			}
 			dest[i] = &Lob{Reader: rdr, IsClob: rdr.IsClob}
+
 		case C.DPI_ORACLE_TYPE_STMT, C.DPI_NATIVE_TYPE_STMT:
 			if isNull {
 				dest[i] = nil
 				continue
 			}
-			//fmt.Printf("STMT\n")
 			st := &statement{conn: r.conn, dpiStmt: C.dpiData_getStmt(d)}
 			var colCount C.uint32_t
 			if C.dpiStmt_getNumQueryColumns(st.dpiStmt, &colCount) == C.DPI_FAILURE {
 				return errors.Wrap(r.getError(), "getNumQueryColumns")
 			}
+			st.Lock()
 			r2, err := st.openRows(int(colCount))
+			st.Unlock()
 			if err != nil {
 				return err
 			}
@@ -439,11 +469,9 @@ func (r *rows) Next(dest []driver.Value) error {
 				dest[i] = nil
 				continue
 			}
-			fmt.Printf("BOOL\n")
 			dest[i] = C.dpiData_getBool(d) == 1
 			//case C.DPI_ORACLE_TYPE_OBJECT: //Default type used for named type columns in the database. Data is transferred to/from Oracle in Oracle's internal format.
 		default:
-			fmt.Printf("OTHER(%d)\n", typ)
 			return errors.Errorf("unsupported column type %d", typ)
 		}
 
@@ -465,7 +493,9 @@ type directRow struct {
 }
 
 func (dr *directRow) Columns() []string {
-	Log("directRow", "Columns")
+	if Log != nil {
+		Log("directRow", "Columns")
+	}
 	switch dr.query {
 	case getConnection:
 		return []string{"CONNECTION"}
@@ -488,7 +518,9 @@ func (dr *directRow) Close() error {
 //
 // Next should return io.EOF when there are no more rows.
 func (dr *directRow) Next(dest []driver.Value) error {
-	Log("directRow", "Next", "query", dr.query, "dest", dest)
+	if Log != nil {
+		Log("directRow", "Next", "query", dr.query, "dest", dest)
+	}
 	switch dr.query {
 	case getConnection:
 		*(dest[0].(*interface{})) = dr.result[0]

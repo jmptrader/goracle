@@ -19,92 +19,61 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/pkg/errors"
 )
 
 // QueryColumn is the described column.
 type QueryColumn struct {
-	Schema, Name                   string
+	Name                           string
 	Type, Length, Precision, Scale int
 	Nullable                       bool
-	CharsetID, CharsetForm         int
+	//Schema string
+	//CharsetID, CharsetForm         int
 }
 
-type execer interface {
+// Execer is the ExecContext of sql.Conn.
+type Execer interface {
 	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
 }
 
-// DescribeQuery describes the columns in the qry string,
-// using DBMS_SQL.PARSE + DBMS_SQL.DESCRIBE_COLUMNS2.
+// DescribeQuery describes the columns in the qry.
 //
 // This can help using unknown-at-compile-time, a.k.a.
 // dynamic queries.
-func DescribeQuery(ctx context.Context, db execer, qry string) ([]QueryColumn, error) {
-	//res := strings.Repeat("\x00", 32767)
-	res := make([]byte, 32767)
-	if _, err := db.ExecContext(ctx, `DECLARE
-  c INTEGER;
-  col_cnt INTEGER;
-  rec_tab DBMS_SQL.DESC_TAB;
-  a DBMS_SQL.DESC_REC;
-  v_idx PLS_INTEGER;
-  res VARCHAR2(32767);
-BEGIN
-  c := DBMS_SQL.OPEN_CURSOR;
-  BEGIN
-    DBMS_SQL.PARSE(c, :1, DBMS_SQL.NATIVE);
-    DBMS_SQL.DESCRIBE_COLUMNS(c, col_cnt, rec_tab);
-    v_idx := rec_tab.FIRST;
-    WHILE v_idx IS NOT NULL LOOP
-      a := rec_tab(v_idx);
-      res := res||a.col_schema_name||' '||a.col_name||' '||a.col_type||' '||
-                  a.col_max_len||' '||a.col_precision||' '||a.col_scale||' '||
-                  (CASE WHEN a.col_null_ok THEN 1 ELSE 0 END)||' '||
-                  a.col_charsetid||' '||a.col_charsetform||
-                  CHR(10);
-      v_idx := rec_tab.NEXT(v_idx);
-    END LOOP;
-	--Loop ended, close cursor
-    DBMS_SQL.CLOSE_CURSOR(c);
-  EXCEPTION WHEN OTHERS THEN NULL;
-    --Error happened, close cursor anyway!
-    DBMS_SQL.CLOSE_CURSOR(c);
-	RAISE;
-  END;
-  :2 := UTL_RAW.CAST_TO_RAW(res);
-END;`, qry, &res,
-	); err != nil {
+func DescribeQuery(ctx context.Context, db Execer, qry string) ([]QueryColumn, error) {
+	c, err := getConn(db)
+	if err != nil {
 		return nil, err
 	}
-	if i := bytes.IndexByte(res, 0); i >= 0 {
-		res = res[:i]
+
+	stmt, err := c.PrepareContext(ctx, qry)
+	if err != nil {
+		return nil, err
 	}
-	lines := bytes.Split(res, []byte{'\n'})
-	cols := make([]QueryColumn, 0, len(lines))
-	var nullable int
-	for _, line := range lines {
-		if len(line) == 0 {
-			continue
+	defer stmt.Close()
+	st := stmt.(*statement)
+	describeOnly(&st.stmtOptions)
+	dR, err := st.QueryContext(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer dR.Close()
+	r := dR.(*rows)
+	cols := make([]QueryColumn, len(r.columns))
+	for i, col := range r.columns {
+		cols[i] = QueryColumn{
+			Name:      col.Name,
+			Type:      int(col.OracleType),
+			Length:    int(col.Size),
+			Precision: int(col.Precision),
+			Scale:     int(col.Scale),
+			Nullable:  col.Nullable,
 		}
-		var col QueryColumn
-		switch j := bytes.IndexByte(line, ' '); j {
-		case -1:
-			continue
-		case 0:
-			line = line[1:]
-		default:
-			col.Schema, line = string(line[:j]), line[j+1:]
-		}
-		if n, err := fmt.Sscanf(string(line), "%s %d %d %d %d %d %d %d",
-			&col.Name, &col.Type, &col.Length, &col.Precision, &col.Scale, &nullable, &col.CharsetID, &col.CharsetForm,
-		); err != nil {
-			return cols, errors.Wrapf(err, "parsing %q (parsed: %d)", line, n)
-		}
-		col.Nullable = nullable != 0
-		cols = append(cols, col)
 	}
 	return cols, nil
 }
@@ -235,7 +204,7 @@ func MapToSlice(qry string, metParam func(string) interface{}) (string, []interf
 
 // EnableDbmsOutput enables DBMS_OUTPUT buffering on the given connection.
 // This is required if you want to retrieve the output with ReadDbmsOutput later.
-func EnableDbmsOutput(ctx context.Context, conn execer) error {
+func EnableDbmsOutput(ctx context.Context, conn Execer) error {
 	qry := "BEGIN DBMS_OUTPUT.enable(1000000); END;"
 	_, err := conn.ExecContext(ctx, qry)
 	return errors.Wrap(err, qry)
@@ -273,14 +242,17 @@ func ReadDbmsOutput(ctx context.Context, w io.Writer, conn preparer) error {
 	}
 }
 
-func ClientVersion(ex execer) (VersionInfo, error) {
+// ClientVersion returns the VersionInfo from the DB.
+func ClientVersion(ex Execer) (VersionInfo, error) {
 	c, err := getConn(ex)
 	if err != nil {
 		return VersionInfo{}, err
 	}
 	return c.drv.ClientVersion()
 }
-func ServerVersion(ex execer) (VersionInfo, error) {
+
+// ServerVersion returns the VersionInfo of the client.
+func ServerVersion(ex Execer) (VersionInfo, error) {
 	c, err := getConn(ex)
 	if err != nil {
 		return VersionInfo{}, err
@@ -288,7 +260,30 @@ func ServerVersion(ex execer) (VersionInfo, error) {
 	return c.ServerVersion()
 }
 
-func getConn(ex execer) (*conn, error) {
+// Conn is the interface for a connection, to be returned by DriverConn.
+type Conn interface {
+	driver.Conn
+	driver.Pinger
+	Break() error
+	BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error)
+	PrepareContext(ctx context.Context, query string) (driver.Stmt, error)
+	Commit() error
+	Rollback() error
+	ServerVersion() (VersionInfo, error)
+	GetObjectType(name string) (*ObjectType, error)
+	NewSubscription(string, func(Event)) (*Subscription, error)
+}
+
+// DriverConn returns the *goracle.conn of the databas/sql.Conn
+func DriverConn(ex Execer) (Conn, error) {
+	return getConn(ex)
+}
+
+var getConnMu sync.Mutex
+
+func getConn(ex Execer) (*conn, error) {
+	getConnMu.Lock()
+	defer getConnMu.Unlock()
 	var c interface{}
 	if _, err := ex.ExecContext(context.Background(), getConnection, sql.Out{Dest: &c}); err != nil {
 		return nil, errors.Wrap(err, "getConnection")

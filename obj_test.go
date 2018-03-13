@@ -28,23 +28,18 @@ import (
 )
 
 var (
-	testDrv                      *drv
 	testCon                      *conn
+	testDrv                      *drv
+	testOpenErr                  error
 	clientVersion, serverVersion VersionInfo
 	initOnce                     sync.Once
 )
 
 func initConn() (*drv, *conn, error) {
-	var err error
 	initOnce.Do(func() {
-		if testDrv, err = newDrv(); err != nil {
+		if testDrv, testOpenErr = newDrv(); testOpenErr != nil {
 			return
 		}
-		clientVersion, err = testDrv.ClientVersion()
-		if err != nil {
-			return
-		}
-		fmt.Println("client:", clientVersion)
 		dc, err := testDrv.Open(
 			fmt.Sprintf("oracle://%s:%s@%s/?poolMinSessions=1&poolMaxSessions=4&poolIncrement=1&connectionClass=POOLED",
 				os.Getenv("GORACLE_DRV_TEST_USERNAME"),
@@ -53,16 +48,12 @@ func initConn() (*drv, *conn, error) {
 			),
 		)
 		if err != nil {
+			testOpenErr = err
 			return
 		}
 		testCon = dc.(*conn)
-		serverVersion, err = testCon.ServerVersion()
-		if err != nil {
-			return
-		}
-		fmt.Println("server:", serverVersion)
 	})
-	return testDrv, testCon, err
+	return testDrv, testCon, testOpenErr
 }
 
 func TestObjectDirect(t *testing.T) {
@@ -79,10 +70,10 @@ func TestObjectDirect(t *testing.T) {
   TYPE rec_typ IS RECORD (int PLS_INTEGER, num NUMBER, vc VARCHAR2(1000), c CHAR(1000), dt DATE);
   TYPE tab_typ IS TABLE OF rec_typ INDEX BY PLS_INTEGER;
 END;`
-	if err := prepExec(ctx, qry); err != nil {
+	if err = prepExec(ctx, testCon, qry); err != nil {
 		t.Fatal(errors.Wrap(err, qry))
 	}
-	defer prepExec(ctx, "DROP PACKAGE test_pkg_obj")
+	defer prepExec(ctx, testCon, "DROP PACKAGE test_pkg_obj")
 
 	//defer tl.enableLogging(t)()
 	ot, err := testCon.GetObjectType("test_pkg_obj.tab_typ")
@@ -96,7 +87,7 @@ END;`
 	t.Log(ot)
 }
 
-func prepExec(ctx context.Context, qry string, args ...driver.NamedValue) error {
+func prepExec(ctx context.Context, testCon *conn, qry string, args ...driver.NamedValue) error {
 	stmt, err := testCon.PrepareContext(ctx, qry)
 	if err != nil {
 		return errors.Wrap(err, qry)

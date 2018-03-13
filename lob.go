@@ -16,7 +16,7 @@
 package goracle
 
 /*
-#include <dpi.h>
+#include "dpiImpl.h"
 */
 import "C"
 import (
@@ -108,7 +108,7 @@ func (dlr *dpiLobReader) Read(p []byte) (int, error) {
 	}
 	if C.dpiLob_readBytes(dlr.dpiLob, dlr.offset+1, n, (*C.char)(unsafe.Pointer(&p[0])), &n) == C.DPI_FAILURE {
 		err := dlr.getError()
-		if dlr.finished = err.Code() == 1403; dlr.finished {
+		if dlr.finished = err.(interface{ Code() int }).Code() == 1403; dlr.finished {
 			dlr.offset += n
 			return int(n), io.EOF
 		}
@@ -164,13 +164,14 @@ func (dlw *dpiLobWriter) Close() error {
 	}
 	lob := dlw.dpiLob
 	dlw.dpiLob = nil
-	C.dpiLob_flushBuffer(lob)
+	//C.dpiLob_flushBuffer(lob)
 	if C.dpiLob_closeResource(lob) == C.DPI_FAILURE {
 		return errors.Wrapf(dlw.getError(), "closeResource(%p)", lob)
 	}
 	return nil
 }
 
+// DirectLob holds a Lob and allows direct (Read/WriteAt, not streaming Read/Write) operations on it.
 type DirectLob struct {
 	conn   *conn
 	dpiLob *C.dpiLob
@@ -180,6 +181,7 @@ type DirectLob struct {
 var _ = io.ReaderAt((*DirectLob)(nil))
 var _ = io.WriterAt((*DirectLob)(nil))
 
+// Close the Lob.
 func (dl *DirectLob) Close() error {
 	if !dl.opened {
 		return nil
@@ -191,6 +193,7 @@ func (dl *DirectLob) Close() error {
 	return nil
 }
 
+// ReadAt reads at most len(p) bytes into p at offset.
 func (dl *DirectLob) ReadAt(p []byte, offset int64) (int, error) {
 	n := C.uint64_t(len(p))
 	if C.dpiLob_readBytes(dl.dpiLob, C.uint64_t(offset)+1, n, (*C.char)(unsafe.Pointer(&p[0])), &n) == C.DPI_FAILURE {
@@ -198,6 +201,8 @@ func (dl *DirectLob) ReadAt(p []byte, offset int64) (int, error) {
 	}
 	return int(n), nil
 }
+
+// WriteAt writes p starting at offset.
 func (dl *DirectLob) WriteAt(p []byte, offset int64) (int, error) {
 	if !dl.opened {
 		//fmt.Printf("open %p\n", lob)

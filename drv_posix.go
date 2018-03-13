@@ -1,3 +1,5 @@
+// +build !windows
+
 // Copyright 2017 Tamás Gulácsi
 //
 //
@@ -15,30 +17,5 @@
 
 package goracle
 
-import (
-	"strings"
-	"testing"
-
-	"github.com/pkg/errors"
-)
-
-func TestSubscr(t *testing.T) {
-	_, testCon, err := initConn()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cb := func(e Event) {
-		t.Log(e)
-	}
-	s, err := testCon.NewSubscription("subscr", cb)
-	if err != nil {
-		if strings.Contains(errors.Cause(err).Error(), "ORA-29970:") {
-			t.Skip(err.Error())
-		}
-		t.Fatalf("%+v", err)
-	}
-	defer s.Close()
-	if err := s.Register("SELECT object_name, TO_CHAR(last_ddl_time, 'YYYY-MM-DD HH24:MI:SS') last_ddl_time FROM user_objects"); err != nil {
-		t.Fatalf("%+v", err)
-	}
-}
+// #cgo LDFLAGS: -ldl -lpthread
+import "C"

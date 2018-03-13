@@ -39,42 +39,50 @@
 package goracle
 
 //go:generate git submodule update --init --recursive
-//go:generate sh -c "cd odpi && make"
-//go:generate echo "sudo cp -a odpi/lib/libodpic.so /usr/local/lib/"
-//go:generate echo "sudo ldconfig /usr/local/lib"
+//go:generate sh -c "rsync -a ./odpi-c/*.md ./odpi/"
+//go:generate rsync -a ./odpi-c/src/ ./odpi/src/
+//go:generate rsync -a ./odpi-c/include/ ./odpi/include/
+//go:generate rsync -a ./odpi-c/embed/ ./odpi/embed/
 
 /*
-//#cgo pkg-config: --define-variable=GOPATH=$GOPATH odpi
-#cgo CFLAGS: -I./odpi/include
-#cgo LDFLAGS: -Lodpi/lib -lodpic -ldl -s
+#cgo CFLAGS: -I./odpi/include -I./odpi/src -I./odpi/embed
 
 #include <stdlib.h>
-#include <dpi.h>
+
+#include "dpi.c"
 */
 import "C"
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"math"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/pkg/errors"
 )
 
-// Version of this driver
-const Version = "v5.0.3"
+const (
+	// DefaultFetchRowCount is the number of prefetched rows by default (if not changed through FetchRowCount statement option).
+	DefaultFetchRowCount = 1 << 8
+
+	// DefaultArraySize is the length of the maximum PL/SQL array by default (if not changed through ArraySize statement option).
+	DefaultArraySize = 1 << 10
+)
 
 const (
 	// DpiMajorVersion is the wanted major version of the underlying ODPI-C library.
-	DpiMajorVersion = 2
+	DpiMajorVersion = C.DPI_MAJOR_VERSION
 	// DpiMinorVersion is the wanted minor version of the underlying ODPI-C library.
-	DpiMinorVersion = 0
+	DpiMinorVersion = C.DPI_MINOR_VERSION
 
 	// DriverName is set on the connection to be seen in the DB
 	DriverName = "gopkg.in/goracle.v2 : " + Version
@@ -83,7 +91,7 @@ const (
 	DefaultPoolMinSessions = 1
 	// DefaultPoolMaxSessions specifies the default value for maxSessions for pool creation.
 	DefaultPoolMaxSessions = 1000
-	// DefaultPoolInrement specifies the default value for increment for pool creation.
+	// DefaultPoolIncrement specifies the default value for increment for pool creation.
 	DefaultPoolIncrement = 1
 	// DefaultConnectionClass is the defailt connectionClass
 	DefaultConnectionClass = "GORACLE"
@@ -93,22 +101,34 @@ const (
 type Number string
 
 var (
-	Int64   = intType{}
+	// Int64 for converting to-from int64.
+	Int64 = intType{}
+	// Float64 for converting to-from float64.
 	Float64 = floatType{}
-	Num     = numType{}
+	// Num for converting to-from Number (string)
+	Num = numType{}
 )
 
 type intType struct{}
 
 func (intType) String() string { return "Int64" }
 func (intType) ConvertValue(v interface{}) (driver.Value, error) {
+	if Log != nil {
+		Log("ConvertValue", "Int64", "value", v)
+	}
 	switch x := v.(type) {
-	case int32:
+	case int8:
 		return int64(x), nil
-	case uint32:
+	case int16:
+		return int64(x), nil
+	case int32:
 		return int64(x), nil
 	case int64:
 		return x, nil
+	case uint16:
+		return int64(x), nil
+	case uint32:
+		return int64(x), nil
 	case uint64:
 		return int64(x), nil
 	case float32:
@@ -121,7 +141,15 @@ func (intType) ConvertValue(v interface{}) (driver.Value, error) {
 			return int64(x), errors.Errorf("non-zero fractional part: %f", f)
 		}
 		return int64(x), nil
+	case string:
+		if x == "" {
+			return 0, nil
+		}
+		return strconv.ParseInt(x, 10, 64)
 	case Number:
+		if x == "" {
+			return 0, nil
+		}
 		return strconv.ParseInt(string(x), 10, 64)
 	default:
 		return nil, errors.Errorf("unknown type %T", v)
@@ -132,8 +160,17 @@ type floatType struct{}
 
 func (floatType) String() string { return "Float64" }
 func (floatType) ConvertValue(v interface{}) (driver.Value, error) {
+	if Log != nil {
+		Log("ConvertValue", "Float64", "value", v)
+	}
 	switch x := v.(type) {
+	case int8:
+		return float64(x), nil
+	case int16:
+		return float64(x), nil
 	case int32:
+		return float64(x), nil
+	case uint16:
 		return float64(x), nil
 	case uint32:
 		return float64(x), nil
@@ -145,7 +182,15 @@ func (floatType) ConvertValue(v interface{}) (driver.Value, error) {
 		return float64(x), nil
 	case float64:
 		return x, nil
+	case string:
+		if x == "" {
+			return 0, nil
+		}
+		return strconv.ParseFloat(x, 64)
 	case Number:
+		if x == "" {
+			return 0, nil
+		}
 		return strconv.ParseFloat(string(x), 64)
 	default:
 		return nil, errors.Errorf("unknown type %T", v)
@@ -156,10 +201,21 @@ type numType struct{}
 
 func (numType) String() string { return "Num" }
 func (numType) ConvertValue(v interface{}) (driver.Value, error) {
+	if Log != nil {
+		Log("ConvertValue", "Num", "value", v)
+	}
 	switch x := v.(type) {
+	case string:
+		if x == "" {
+			return 0, nil
+		}
+		return x, nil
 	case Number:
+		if x == "" {
+			return 0, nil
+		}
 		return string(x), nil
-	case int32, uint32, int64, uint64:
+	case int8, int16, int32, int64, uint16, uint32, uint64:
 		return fmt.Sprintf("%d", x), nil
 	case float32, float64:
 		return fmt.Sprintf("%f", x), nil
@@ -168,12 +224,73 @@ func (numType) ConvertValue(v interface{}) (driver.Value, error) {
 	}
 }
 func (n Number) String() string { return string(n) }
+
+// Value returns the Number as driver.Value
 func (n Number) Value() (driver.Value, error) {
 	return string(n), nil
 }
 
-// Log function
-var Log = func(...interface{}) error { return nil }
+// Scan into the Number from a driver.Value.
+func (n *Number) Scan(v interface{}) error {
+	if v == nil {
+		*n = ""
+		return nil
+	}
+	switch x := v.(type) {
+	case string:
+		*n = Number(x)
+	case Number:
+		*n = x
+	case int8, int16, int32, int64, uint16, uint32, uint64:
+		*n = Number(fmt.Sprintf("%d", x))
+	case float32, float64:
+		*n = Number(fmt.Sprintf("%f", x))
+	default:
+		return errors.Errorf("unknown type %T", v)
+	}
+	return nil
+}
+
+// MarshalText marshals a Number to text.
+func (n Number) MarshalText() ([]byte, error) { return []byte(n), nil }
+
+// UnmarshalText parses text into a Number.
+func (n *Number) UnmarshalText(p []byte) error {
+	var dotNum int
+	for i, c := range p {
+		if !(c == '-' && i == 0 || '0' <= c && c <= '9') {
+			if c == '.' {
+				dotNum++
+				if dotNum == 1 {
+					continue
+				}
+			}
+			return errors.Errorf("unknown char %c in %q", c, p)
+		}
+	}
+	*n = Number(p)
+	return nil
+}
+
+// MarshalJSON marshals a Number into a JSON string.
+func (n Number) MarshalJSON() ([]byte, error) { return n.MarshalText() }
+
+// UnmarshalJSON parses a JSON string into the Number.
+func (n *Number) UnmarshalJSON(p []byte) error {
+	*n = Number("")
+	if len(p) == 0 {
+		return nil
+	}
+	if len(p) > 2 && p[0] == '"' && p[len(p)-1] == '"' {
+		p = p[1 : len(p)-1]
+	}
+	return n.UnmarshalText(p)
+}
+
+// Log function. By default, it's nil, and thus logs nothing.
+// If you want to change this, change it to a github.com/go-kit/kit/log.Swapper.Log
+// or analog to be race-free.
+var Log func(...interface{}) error
 
 func init() {
 	d, err := newDrv()
@@ -194,11 +311,11 @@ type drv struct {
 
 func newDrv() (*drv, error) {
 	var d drv
-	err := &oraErr{}
+	var errInfo C.dpiErrorInfo
 	if C.dpiContext_create(C.uint(DpiMajorVersion), C.uint(DpiMinorVersion),
-		(**C.dpiContext)(unsafe.Pointer(&d.dpiContext)), &err.errInfo,
+		(**C.dpiContext)(unsafe.Pointer(&d.dpiContext)), &errInfo,
 	) == C.DPI_FAILURE {
-		return nil, err
+		return nil, fromErrorInfo(errInfo)
 	}
 	d.pools = make(map[string]*C.dpiPool)
 	return &d, nil
@@ -211,7 +328,8 @@ func (d *drv) Open(connString string) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return d.openConn(P)
+	conn, err := d.openConn(P)
+	return conn, maybeBadConn(err)
 }
 
 func (d *drv) ClientVersion() (VersionInfo, error) {
@@ -226,11 +344,17 @@ func (d *drv) ClientVersion() (VersionInfo, error) {
 	return d.clientVersion, nil
 }
 
-func (d *drv) openConn(P connectionParams) (*conn, error) {
+func (d *drv) openConn(P ConnectionParams) (*conn, error) {
 	c := conn{drv: d, connParams: P}
 	connString := P.StringNoClass()
 
-	defer func() { d.poolsMu.Lock(); Log("pools", d.pools, "conn", P.String()); d.poolsMu.Unlock() }()
+	defer func() {
+		d.poolsMu.Lock()
+		if Log != nil {
+			Log("pools", d.pools, "conn", P.String())
+		}
+		d.poolsMu.Unlock()
+	}()
 	authMode := C.dpiAuthMode(C.DPI_MODE_AUTH_DEFAULT)
 	if P.IsSysDBA {
 		authMode |= C.DPI_MODE_AUTH_SYSDBA
@@ -257,7 +381,9 @@ func (d *drv) openConn(P connectionParams) (*conn, error) {
 		d.poolsMu.Unlock()
 		if dp != nil {
 			dc := C.malloc(C.sizeof_void)
-			Log("C", "dpiPool_acquireConnection", "conn", connCreateParams)
+			if Log != nil {
+				Log("C", "dpiPool_acquireConnection", "conn", connCreateParams)
+			}
 			if C.dpiPool_acquireConnection(
 				dp,
 				nil, 0, nil, 0, &connCreateParams,
@@ -299,7 +425,9 @@ func (d *drv) openConn(P connectionParams) (*conn, error) {
 
 	if P.IsSysDBA || P.IsSysOper {
 		dc := C.malloc(C.sizeof_void)
-		Log("C", "dpiConn_create", "username", P.Username, "password", P.Password, "sid", P.SID, "common", commonCreateParams, "conn", connCreateParams)
+		if Log != nil {
+			Log("C", "dpiConn_create", "username", P.Username, "password", P.Password, "sid", P.SID, "common", commonCreateParams, "conn", connCreateParams)
+		}
 		if C.dpiConn_create(
 			d.dpiContext,
 			cUserName, C.uint32_t(len(P.Username)),
@@ -328,7 +456,9 @@ func (d *drv) openConn(P connectionParams) (*conn, error) {
 	poolCreateParams.getMode = C.DPI_MODE_POOL_GET_NOWAIT
 
 	var dp *C.dpiPool
-	Log("C", "dpiPool_create", "username", P.Username, "password", P.Password, "sid", P.SID, "common", commonCreateParams, "pool", poolCreateParams)
+	if Log != nil {
+		Log("C", "dpiPool_create", "username", P.Username, "password", P.Password, "sid", P.SID, "common", commonCreateParams, "pool", poolCreateParams)
+	}
 	if C.dpiPool_create(
 		d.dpiContext,
 		cUserName, C.uint32_t(len(P.Username)),
@@ -338,13 +468,13 @@ func (d *drv) openConn(P connectionParams) (*conn, error) {
 		&poolCreateParams,
 		(**C.dpiPool)(unsafe.Pointer(&dp)),
 	) == C.DPI_FAILURE {
-		return nil, errors.Wrapf(d.getError(), "username=%q password=%q minSessions=%d maxSessions=%d poolIncrement=%d extAuth=%d",
-			P.Username, strings.Repeat("*", len(P.Password)),
+		return nil, errors.Wrapf(d.getError(), "username=%q password=%q SID=%q minSessions=%d maxSessions=%d poolIncrement=%d extAuth=%d ",
+			P.Username, strings.Repeat("*", len(P.Password)), P.SID,
 			P.MinSessions, P.MaxSessions, P.PoolIncrement, extAuth)
 	}
 	C.dpiPool_setTimeout(dp, 300)
-	//C.dpiPool_setMaxLifetimeSession(dp, 3600)
-	C.dpiPool_setStmtCacheSize(dp, 1<<20)
+	C.dpiPool_setMaxLifetimeSession(dp, 3600)
+	C.dpiPool_setStmtCacheSize(dp, 40)
 	d.poolsMu.Lock()
 	d.pools[connString] = dp
 	d.poolsMu.Unlock()
@@ -352,38 +482,50 @@ func (d *drv) openConn(P connectionParams) (*conn, error) {
 	return d.openConn(P)
 }
 
-type connectionParams struct {
+// ConnectionParams holds the params for a connection (pool).
+// You can use ConnectionParams{...}.String() as a connection string
+// in sql.Open.
+type ConnectionParams struct {
 	Username, Password, SID, ConnClass      string
 	IsSysDBA, IsSysOper                     bool
 	MinSessions, MaxSessions, PoolIncrement int
 }
 
-func (P connectionParams) StringNoClass() string {
+// StringNoClass returns the string representation of ConnectionParams, without class info.
+func (P ConnectionParams) StringNoClass() string {
 	return P.string(false)
 }
-func (P connectionParams) String() string {
+func (P ConnectionParams) String() string {
 	return P.string(true)
 }
 
-func (P connectionParams) string(class bool) string {
+func (P ConnectionParams) string(class bool) string {
+	host, path := P.SID, ""
+	if i := strings.IndexByte(host, '/'); i >= 0 {
+		host, path = host[:i], host[i:]
+	}
 	cc := ""
 	if class {
 		cc = fmt.Sprintf("connectionClass=%s&", url.QueryEscape(P.ConnClass))
 	}
 	// params should be sorted lexicographically
-	return fmt.Sprintf("oracle://%s:%s@%s/?"+
-		cc+
-		"poolIncrement=%d&poolMaxSessions=%d&poolMinSessions=%d&"+
-		"sysdba=%d&sysoper=%d",
-		P.Username, P.Password, P.SID,
-		P.PoolIncrement, P.MaxSessions, P.MinSessions,
-		b2i(P.IsSysDBA), b2i(P.IsSysOper),
-	)
+	return (&url.URL{
+		Scheme: "oracle",
+		User:   url.UserPassword(P.Username, P.Password),
+		Host:   host,
+		Path:   path,
+		RawQuery: cc +
+			fmt.Sprintf("poolIncrement=%d&poolMaxSessions=%d&poolMinSessions=%d&"+
+				"sysdba=%d&sysoper=%d",
+				P.PoolIncrement, P.MaxSessions, P.MinSessions,
+				b2i(P.IsSysDBA), b2i(P.IsSysOper),
+			),
+	}).String()
 }
 
 // ParseConnString parses the given connection string into a struct.
-func ParseConnString(connString string) (connectionParams, error) {
-	P := connectionParams{
+func ParseConnString(connString string) (ConnectionParams, error) {
+	P := ConnectionParams{
 		MinSessions:   DefaultPoolMinSessions,
 		MaxSessions:   DefaultPoolMaxSessions,
 		PoolIncrement: DefaultPoolIncrement,
@@ -395,10 +537,14 @@ func ParseConnString(connString string) (connectionParams, error) {
 			return P, errors.Errorf("no / in %q", connString)
 		}
 		P.Username, connString = connString[:i], connString[i+1:]
-		if i = strings.IndexByte(connString, '@'); i < 0 {
-			return P, errors.Errorf("no @ in %q", connString)
+		if i = strings.IndexByte(connString, '@'); i >= 0 {
+			P.Password, P.SID = connString[:i], connString[i+1:]
+		} else {
+			P.Password = connString
+			if P.SID = os.Getenv("ORACLE_SID"); P.SID == "" {
+				P.SID = os.Getenv("TWO_TASK")
+			}
 		}
-		P.Password, P.SID = connString[:i], connString[i+1:]
 		uSid := strings.ToUpper(P.SID)
 		if P.IsSysDBA = strings.HasSuffix(uSid, " AS SYSDBA"); P.IsSysDBA {
 			P.SID = P.SID[:len(P.SID)-10]
@@ -412,7 +558,7 @@ func ParseConnString(connString string) (connectionParams, error) {
 	}
 	u, err := url.Parse(connString)
 	if err != nil {
-		return P, err
+		return P, errors.Wrap(err, connString)
 	}
 	if usr := u.User; usr != nil {
 		P.Username = usr.Username()
@@ -421,6 +567,9 @@ func ParseConnString(connString string) (connectionParams, error) {
 	P.SID = u.Hostname()
 	if u.Port() != "" {
 		P.SID += ":" + u.Port()
+	}
+	if u.Path != "" && u.Path != "/" {
+		P.SID += u.Path
 	}
 	q := u.Query()
 	if vv, ok := q["connectionClass"]; ok {
@@ -460,28 +609,56 @@ func ParseConnString(connString string) (connectionParams, error) {
 	return P, nil
 }
 
-type oraErr struct {
-	errInfo C.dpiErrorInfo
+// OraErr is an error holding the ORA-01234 code and the message.
+type OraErr struct {
+	code    int
+	message string
 }
 
-func (oe *oraErr) Code() int       { return int(oe.errInfo.code) }
-func (oe *oraErr) Message() string { return C.GoString(oe.errInfo.message) }
-func (oe *oraErr) Error() string {
+var _ = error((*OraErr)(nil))
+
+// Code returns the OraErr's error code.
+func (oe *OraErr) Code() int { return oe.code }
+
+// Message returns the OraErr's message.
+func (oe *OraErr) Message() string { return oe.message }
+func (oe *OraErr) Error() string {
 	msg := oe.Message()
-	if oe.errInfo.code == 0 && msg == "" {
+	if oe.code == 0 && msg == "" {
 		return ""
 	}
-	prefix := fmt.Sprintf("ORA-%05d: ", oe.Code())
-	if strings.HasPrefix(msg, prefix) {
-		return msg
+	return fmt.Sprintf("ORA-%05d: %s", oe.code, oe.message)
+}
+func fromErrorInfo(errInfo C.dpiErrorInfo) *OraErr {
+	oe := OraErr{
+		code:    int(errInfo.code),
+		message: strings.TrimSpace(C.GoString(errInfo.message)),
 	}
-	return prefix + msg
+	if oe.code == 0 && strings.HasPrefix(oe.message, "ORA-") &&
+		len(oe.message) > 9 && oe.message[9] == ':' {
+		if i, _ := strconv.Atoi(oe.message[4:9]); i > 0 {
+			oe.code = i
+		}
+	}
+	oe.message = strings.TrimPrefix(oe.message, fmt.Sprintf("ORA-%05d: ", oe.Code()))
+	return &oe
 }
 
-func (d *drv) getError() *oraErr {
-	var oe oraErr
-	C.dpiContext_getError(d.dpiContext, &oe.errInfo)
-	return &oe
+// newErrorInfo is just for testing: testing cannot use Cgo...
+func newErrorInfo(code int, message string) C.dpiErrorInfo {
+	return C.dpiErrorInfo{code: C.int32_t(code), message: C.CString(message)}
+}
+
+// against deadcode
+var _ = newErrorInfo
+
+func (d *drv) getError() *OraErr {
+	if d == nil || d.dpiContext == nil {
+		return &OraErr{code: -12153, message: driver.ErrBadConn.Error()}
+	}
+	var errInfo C.dpiErrorInfo
+	C.dpiContext_getError(d.dpiContext, &errInfo)
+	return fromErrorInfo(errInfo)
 }
 
 func b2i(b bool) uint8 {
@@ -491,6 +668,7 @@ func b2i(b bool) uint8 {
 	return 0
 }
 
+// VersionInfo holds version info returned by Oracle DB.
 type VersionInfo struct {
 	Version, Release, Update, PortRelease, PortUpdate, Full int
 	ServerRelease                                           string
@@ -510,4 +688,47 @@ func (V VersionInfo) String() string {
 		s = " [" + V.ServerRelease + "]"
 	}
 	return fmt.Sprintf("%d.%d.%d.%d.%d%s", V.Version, V.Release, V.Update, V.PortRelease, V.PortUpdate, s)
+}
+
+var timezones = make(map[[2]C.int8_t]*time.Location)
+var timezonesMu sync.RWMutex
+
+func timeZoneFor(hourOffset, minuteOffset C.int8_t) *time.Location {
+	if hourOffset == 0 && minuteOffset == 0 {
+		return time.UTC
+	}
+	key := [2]C.int8_t{hourOffset, minuteOffset}
+	timezonesMu.RLock()
+	tz := timezones[key]
+	timezonesMu.RUnlock()
+	if tz == nil {
+		timezonesMu.Lock()
+		if tz = timezones[key]; tz == nil {
+			tz = time.FixedZone(
+				fmt.Sprintf("%02d:%02d", hourOffset, minuteOffset),
+				int(hourOffset)*3600+int(minuteOffset)*60,
+			)
+			timezones[key] = tz
+		}
+		timezonesMu.Unlock()
+	}
+	return tz
+}
+
+type ctxKey string
+
+const logCtxKey = ctxKey("goracle.Log")
+
+type logFunc func(...interface{}) error
+
+func ctxGetLog(ctx context.Context) logFunc {
+	if lgr, ok := ctx.Value(logCtxKey).(func(...interface{}) error); ok {
+		return lgr
+	}
+	return Log
+}
+
+// ContextWithLog returns a context with the given log function.
+func ContextWithLog(ctx context.Context, logF func(...interface{}) error) context.Context {
+	return context.WithValue(ctx, logCtxKey, logF)
 }
